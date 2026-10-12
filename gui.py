@@ -1,8 +1,11 @@
-import os
+from __future__ import annotations
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from typing import Optional, Dict, Any
 import numpy as np
 from matplotlib.figure import Figure
+from matplotlib.axes import Axes
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 from audio_loader import AudioLoader
@@ -17,28 +20,37 @@ class AudioAnalyzerGUI:
     - AudioLoader (wczytywanie)
     - ChannelManager (obsługa kanałów)
     - AudioResampler (próbkowanie)
-    - FourierAnalyzer (FFT i kryterium Nyquista)
+    - FourierAnalyzer (FFT i egzekwowanie kryterium Nyquista)
     """
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Analizator Dźwięku MP3 - Fourier & Kryterium Nyquista")
+        self.root.title("Analizator Dźwięku MP3 - Dowolne Próbkowanie & Wymóg Nyquista")
         self.root.geometry("1150x820")
         self.root.minsize(950, 650)
 
         # Stan danych
-        self.raw_data: np.ndarray | None = None
-        self.metadata: dict | None = None
+        self.raw_data: Optional[np.ndarray] = None
+        self.metadata: Optional[Dict[str, Any]] = None
+        self.current_channel_max_freq: float = 0.0
+
+        # Zmienna do pola wpisywania częstotliwości próbkowania
+        self.sample_rate_var = tk.StringVar(value="")
+
+        # Referencje do wykresów (osobne obiekty Axes dla pełnej zgodności typów z IDE)
+        self.ax_orig_time: Axes
+        self.ax_res_time: Axes
+        self.ax_orig_fft: Axes
+        self.ax_res_fft: Axes
 
         self._setup_ui()
 
     def _setup_ui(self):
         """Inicjalizacja i ułożenie komponentów GUI."""
-        # 1. Górny panel sterowania
         control_frame = ttk.LabelFrame(self.root, text="Panel sterowania i parametry", padding=10)
         control_frame.pack(fill="x", padx=10, pady=5)
 
-        # Wiersz 1: Przyciski plików i zamknięcia
+        # Wiersz 1: Przyciski plików, info i wyjście
         row1_frame = ttk.Frame(control_frame)
         row1_frame.pack(fill="x", pady=2)
 
@@ -54,65 +66,66 @@ class AudioAnalyzerGUI:
         )
         self.lbl_file_info.pack(side="left", padx=10, fill="x", expand=True)
 
-        # Przycisk WYJDŹ
+        # Przycisk Wyjdź
         self.btn_exit = ttk.Button(
             row1_frame, text="🚪 Wyjdź", command=self._on_exit
         )
         self.btn_exit.pack(side="right", padx=5)
 
-        # Wiersz 2: Wybór kanału, docelowego Fs i uruchomienie analizy
+        # Wiersz 2: Wybór kanału, DOWOLNE wpisywanie Fs i przycisk analizy
         row2_frame = ttk.Frame(control_frame)
-        row2_frame.pack(fill="x", pady=6)
+        row2_frame.pack(fill="x", pady=8)
 
         ttk.Label(row2_frame, text="Kanał dźwięku:").pack(side="left", padx=5)
         self.combo_channel = ttk.Combobox(
             row2_frame, values=["Brak danych"], state="readonly", width=18
         )
         self.combo_channel.current(0)
+        self.combo_channel.bind("<<ComboboxSelected>>", self._on_channel_changed)
         self.combo_channel.pack(side="left", padx=5)
 
-        ttk.Label(row2_frame, text="Docelowa częstotliwość próbkowania:").pack(
-            side="left", padx=(20, 5)
+        # Pole na DOWOLNĄ częstotliwość próbkowania (zamiast sztywnych opcji)
+        ttk.Label(row2_frame, text="Częstotliwość próbkowania:").pack(side="left", padx=(20, 5))
+        self.entry_sample_rate = ttk.Entry(
+            row2_frame, textvariable=self.sample_rate_var, width=12, font=("Segoe UI", 9)
         )
-        self.combo_sample_rate = ttk.Combobox(
-            row2_frame,
-            values=["8000", "11025", "16000", "22050", "32000", "44100", "48000"],
-            width=12,
-        )
-        self.combo_sample_rate.set("16000")
-        self.combo_sample_rate.pack(side="left", padx=5)
+        self.entry_sample_rate.pack(side="left", padx=2)
         ttk.Label(row2_frame, text="Hz").pack(side="left", padx=(2, 10))
 
+        # Przycisk analizy
         self.btn_analyze = ttk.Button(
             row2_frame,
             text="⚡ Przetwórz i analizuj (FFT)",
             command=self._on_analyze,
             state="disabled",
         )
-        self.btn_analyze.pack(side="left", padx=20)
+        self.btn_analyze.pack(side="left", padx=15)
 
-        # Wiersz 3: Sekcja z KLAUZULĄ KRYTERIUM NYQUISTA
-        self.nyquist_frame = ttk.LabelFrame(
-            control_frame, text="Weryfikacja kryterium Nyquista-Shannona", padding=8
-        )
-        self.nyquist_frame.pack(fill="x", pady=(5, 2))
+        # Wiersz 3: Etykieta wymogu Nyquista i statusu
+        self.nyquist_info_frame = ttk.Frame(control_frame)
+        self.nyquist_info_frame.pack(fill="x", pady=(4, 0))
 
-        self.lbl_nyquist = ttk.Label(
-            self.nyquist_frame,
-            text="Wczytaj plik i uruchom analizę, aby sprawdzić spełnienie kryterium Nyquista dla wybranego próbkowania.",
-            foreground="#666666",
-            wraplength=1050,
-            justify="left",
+        self.lbl_nyquist_requirement = ttk.Label(
+            self.nyquist_info_frame,
+            text="Wymóg Nyquista: Wczytaj plik, aby sprawdzić minimalną dozwoloną częstotliwość próbkowania (2 × f_max).",
+            foreground="#555555",
             font=("Segoe UI", 9),
         )
-        self.lbl_nyquist.pack(anchor="w", padx=5)
+        self.lbl_nyquist_requirement.pack(anchor="w", padx=5)
 
-        # 2. Obszar wykresów Matplotlib (2x2)
+        # Obszar wykresów Matplotlib (2x2)
         plot_frame = ttk.Frame(self.root)
         plot_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.fig = Figure(figsize=(10, 6), dpi=100)
-        self.axes = self.fig.subplots(2, 2)
+        
+        # Bezpośrednie rozpakowanie osi jako obiektów typu Axes
+        axes_grid = self.fig.subplots(2, 2)
+        self.ax_orig_time = axes_grid[0, 0]
+        self.ax_res_time = axes_grid[0, 1]
+        self.ax_orig_fft = axes_grid[1, 0]
+        self.ax_res_fft = axes_grid[1, 1]
+
         self._init_empty_plots()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
@@ -122,17 +135,15 @@ class AudioAnalyzerGUI:
         self.toolbar.update()
 
     def _init_empty_plots(self):
-        """Ustawienie pustych wykresów początkowych z opisami osi."""
-        titles = [
-            ("Dźwięk przed próbkowaniem (Dziedzina czasu)", "Czas [s]", "Amplituda"),
-            ("Dźwięk po próbkowaniu (Dziedzina czasu)", "Czas [s]", "Amplituda"),
-            ("Widmo FFT - Przed próbkowaniem", "Częstotliwość [Hz]", "Magnituda"),
-            ("Widmo FFT - Po próbkowaniu", "Częstotliwość [Hz]", "Magnituda"),
+        """Inicjalizacja pustych wykresów."""
+        plots_info = [
+            (self.ax_orig_time, "Dźwięk przed próbkowaniem (Dziedzina czasu)", "Czas [s]", "Amplituda"),
+            (self.ax_res_time, "Dźwięk po próbkowaniu (Dziedzina czasu)", "Czas [s]", "Amplituda"),
+            (self.ax_orig_fft, "Widmo FFT - Przed próbkowaniem", "Częstotliwość [Hz]", "Magnituda"),
+            (self.ax_res_fft, "Widmo FFT - Po próbkowaniu", "Częstotliwość [Hz]", "Magnituda"),
         ]
 
-        plot_coords = [(0, 0), (0, 1), (1, 0), (1, 1)]
-        for (row, col), (title, xlabel, ylabel) in zip(plot_coords, titles):
-            ax = self.axes[row, col]
+        for ax, title, xlabel, ylabel in plots_info:
             ax.clear()
             ax.set_title(title, fontsize=9, fontweight="bold")
             ax.set_xlabel(xlabel, fontsize=8)
@@ -142,7 +153,7 @@ class AudioAnalyzerGUI:
         self.fig.subplots_adjust(hspace=0.45, wspace=0.25, left=0.07, right=0.98, top=0.93, bottom=0.1)
 
     def _on_load_file(self):
-        """Wczytanie pliku przez AudioLoader i przygotowanie opcji kanałów."""
+        """Wczytanie pliku audio."""
         filetypes = [
             ("Pliki audio", "*.mp3 *.wav *.ogg *.flac"),
             ("Pliki MP3", "*.mp3"),
@@ -158,7 +169,6 @@ class AudioAnalyzerGUI:
         try:
             self.raw_data, self.metadata = AudioLoader.load(filepath)
 
-            # Aktualizacja informacji o pliku
             mins = int(self.metadata["duration"] // 60)
             secs = self.metadata["duration"] % 60
             info_text = (
@@ -170,36 +180,71 @@ class AudioAnalyzerGUI:
             )
             self.lbl_file_info.config(text=info_text, foreground="#000000")
 
-            # Ustawienie kanałów w ChannelManager
+            # Ustawienie kanałów
             channel_options = ChannelManager.get_channel_options(self.metadata["channels"])
             self.combo_channel.config(values=channel_options)
             self.combo_channel.current(0)
 
-            # Sugerowane Fs
-            self.combo_sample_rate.set(str(self.metadata["sample_rate"]))
+            # Wpisanie domyślnej częstotliwości (równej oryginalnej)
+            self.sample_rate_var.set(str(self.metadata["sample_rate"]))
 
+            # Odblokowanie przycisku analizy i aktualizacja limitu Nyquista
             self.btn_analyze.config(state="normal")
-            self.lbl_nyquist.config(
-                text="Plik załadowany. Wybierz kanał oraz docelowe Fs i kliknij 'Przetwórz i analizuj (FFT)', aby ocenić kryterium Nyquista.",
-                foreground="#0055cc",
-            )
+            self._update_nyquist_limit()
 
         except Exception as e:
             messagebox.showerror("Błąd wczytywania", f"Nie udało się wczytać pliku audio:\n{str(e)}")
 
+    def _on_channel_changed(self, _event: Any = None):
+        """Wywoływane po zmianie kanału – aktualizuje wyliczony limit Nyquista."""
+        self._update_nyquist_limit()
+
+    def _update_nyquist_limit(self):
+        """Oblicza maksymalną częstotliwość f_max dla aktualnego kanału i wyświetla wymagane Fs."""
+        if self.raw_data is None or self.metadata is None or self.raw_data.size == 0:
+            return
+
+        try:
+            selected_channel = self.combo_channel.get()
+            orig_signal = ChannelManager.extract_channel(self.raw_data, selected_channel)
+            orig_sr = self.metadata["sample_rate"]
+
+            freqs_orig, mag_orig = FourierAnalyzer.compute_fft(orig_signal, orig_sr)
+            self.current_channel_max_freq = FourierAnalyzer.find_highest_significant_frequency(
+                freqs_orig, mag_orig
+            )
+            min_required_sr = int(np.ceil(2.0 * self.current_channel_max_freq))
+
+            self.lbl_nyquist_requirement.config(
+                text=(
+                    f"🔒 Wymóg Nyquista: Maksymalna składowa sygnału = {self.current_channel_max_freq:.1f} Hz. "
+                    f"Wprowadzana częstotliwość próbkowania MUSI wynosić co najmniej {min_required_sr} Hz."
+                ),
+                foreground="#0055aa",
+            )
+        except Exception as ex:
+            self.lbl_nyquist_requirement.config(
+                text=f"Nie udało się oszacować pasma: {ex}",
+                foreground="#aa5500",
+            )
+
     def _on_analyze(self):
-        """Główna akcja przetwarzania: ekstrakcja, resampling, FFT i sprawdzenie Nyquista."""
+        """Walidacja wymogu Nyquista i wykonanie analizy."""
         if self.raw_data is None or self.metadata is None:
             messagebox.showwarning("Brak danych", "Najpierw wczytaj plik audio.")
             return
 
+        # 1. Walidacja formatu wpisanej liczby
+        raw_sr_str = self.sample_rate_var.get().strip()
         try:
-            target_sr = int(self.combo_sample_rate.get().strip())
+            target_sr = int(raw_sr_str)
             if target_sr <= 0:
                 raise ValueError()
         except ValueError:
             messagebox.showerror(
-                "Błąd", "Częstotliwość próbkowania musi być dodatnią liczbą całkowitą (np. 16000)."
+                "Nieprawidłowa wartość",
+                f"Wpisana częstotliwość próbkowania '{raw_sr_str}' nie jest prawidłową dodatnią liczbą całkowitą.\n"
+                f"Wpisz np. 16000, 22050, 44100.",
             )
             return
 
@@ -207,80 +252,114 @@ class AudioAnalyzerGUI:
         orig_sr = self.metadata["sample_rate"]
 
         try:
-            # 1. Separacja kanału przez ChannelManager
+            # 2. Pobranie sygnału i FFT oryginału
             orig_signal = ChannelManager.extract_channel(self.raw_data, selected_channel)
-            orig_time = np.arange(len(orig_signal)) / orig_sr
+            freqs_orig, mag_orig = FourierAnalyzer.compute_fft(orig_signal, orig_sr)
+            max_significant_freq = FourierAnalyzer.find_highest_significant_frequency(freqs_orig, mag_orig)
 
-            # 2. Resampling przez AudioResampler
+            # 3. BLOKADA: Sprawdzenie spełnienia kryterium Nyquista
+            is_valid, msg, min_required_sr = FourierAnalyzer.validate_nyquist_frequency(
+                target_sr, max_significant_freq
+            )
+
+            if not is_valid:
+                # Nie zezwalaj na złamanie wymogu Nyquista
+                messagebox.showerror("Zablokowano próbkowanie (Wymóg Nyquista)", msg)
+                self.lbl_nyquist_requirement.config(
+                    text=f"⛔ BŁĄD NYQUISTA: Wartość {target_sr} Hz jest zbyt niska! Wymagane minimum to {min_required_sr} Hz.",
+                    foreground="#cc0000",
+                )
+                return
+
+            # Jeśli wymóg jest spełniony, informujemy użytkownika
+            self.lbl_nyquist_requirement.config(
+                text=f"✅ {msg}",
+                foreground="#007700",
+            )
+
+            # 4. Wykonanie próbkowania (resampling)
+            orig_time = np.arange(len(orig_signal)) / orig_sr
             resampled_signal, resampled_time = AudioResampler.resample(
                 orig_signal, orig_sr, target_sr
             )
 
-            # 3. Transformata Fouriera przez FourierAnalyzer
-            freqs_orig, mag_orig = FourierAnalyzer.compute_fft(orig_signal, orig_sr)
+            # 5. FFT sygnału po próbkowaniu
             freqs_resamp, mag_resamp = FourierAnalyzer.compute_fft(resampled_signal, target_sr)
 
-            # 4. Ocena KRYTERIUM NYQUISTA
-            max_significant_freq = FourierAnalyzer.find_highest_significant_frequency(freqs_orig, mag_orig)
-            nyquist_eval = FourierAnalyzer.evaluate_nyquist_criterion(target_sr, max_significant_freq)
-
-            # Prezentacja klauzuli Nyquista w GUI
-            self.lbl_nyquist.config(
-                text=nyquist_eval["clause"],
-                foreground="#007700" if nyquist_eval["is_satisfied"] else "#aa2200",
-                font=("Segoe UI", 9, "bold" if not nyquist_eval["is_satisfied"] else "normal"),
-            )
-
-            # 5. Przygotowanie danych do rysowania (downsampling dla responsywności)
+            # 6. Optymalizacja punktów do wykresów
             t_orig_p, s_orig_p = AudioResampler.downsample_for_plot(orig_time, orig_signal)
             t_res_p, s_res_p = AudioResampler.downsample_for_plot(resampled_time, resampled_signal)
             f_orig_p, m_orig_p = AudioResampler.downsample_for_plot(freqs_orig, mag_orig)
             f_res_p, m_res_p = AudioResampler.downsample_for_plot(freqs_resamp, mag_resamp)
 
-            # 6. Rysowanie wykresów
-            # [0, 0] Oryginalny czas
-            ax1 = self.axes[0, 0]
-            ax1.clear()
-            ax1.plot(t_orig_p, s_orig_p, color="#1f77b4", linewidth=0.8)
-            ax1.set_title(f"Przed próbkowaniem - Czas (Fs = {orig_sr} Hz, {selected_channel})", fontsize=9, fontweight="bold")
-            ax1.set_xlabel("Czas [s]", fontsize=8)
-            ax1.set_ylabel("Amplituda", fontsize=8)
-            ax1.grid(True, linestyle="--", alpha=0.5)
+            # 7. Rysowanie
+            # Wykres 1: Czas przed
+            self.ax_orig_time.clear()
+            self.ax_orig_time.plot(t_orig_p, s_orig_p, color="#1f77b4", linewidth=0.8)
+            self.ax_orig_time.set_title(
+                f"Przed próbkowaniem - Czas (Fs = {orig_sr} Hz, {selected_channel})",
+                fontsize=9,
+                fontweight="bold",
+            )
+            self.ax_orig_time.set_xlabel("Czas [s]", fontsize=8)
+            self.ax_orig_time.set_ylabel("Amplituda", fontsize=8)
+            self.ax_orig_time.grid(True, linestyle="--", alpha=0.5)
 
-            # [0, 1] Resamplowany czas
-            ax2 = self.axes[0, 1]
-            ax2.clear()
-            ax2.plot(t_res_p, s_res_p, color="#d62728", linewidth=0.8)
-            ax2.set_title(f"Po próbkowaniu - Czas (Nowe Fs = {target_sr} Hz)", fontsize=9, fontweight="bold")
-            ax2.set_xlabel("Czas [s]", fontsize=8)
-            ax2.set_ylabel("Amplituda", fontsize=8)
-            ax2.grid(True, linestyle="--", alpha=0.5)
+            # Wykres 2: Czas po próbkowaniu
+            self.ax_res_time.clear()
+            self.ax_res_time.plot(t_res_p, s_res_p, color="#d62728", linewidth=0.8)
+            self.ax_res_time.set_title(
+                f"Po próbkowaniu - Czas (Nowe Fs = {target_sr} Hz)",
+                fontsize=9,
+                fontweight="bold",
+            )
+            self.ax_res_time.set_xlabel("Czas [s]", fontsize=8)
+            self.ax_res_time.set_ylabel("Amplituda", fontsize=8)
+            self.ax_res_time.grid(True, linestyle="--", alpha=0.5)
 
-            # [1, 0] Oryginalne FFT
+            # Wykres 3: FFT przed
             orig_nyquist = orig_sr / 2
-            ax3 = self.axes[1, 0]
-            ax3.clear()
-            ax3.plot(f_orig_p, m_orig_p, color="#1f77b4", linewidth=0.8, label="Widmo sygnału")
-            ax3.axvline(orig_nyquist, color="purple", linestyle="--", linewidth=1.2, label=f"Nyquist ({orig_nyquist:.0f} Hz)")
-            ax3.set_title(f"Przed próbkowaniem - Widmo FFT (Pasmo do {orig_nyquist:.0f} Hz)", fontsize=9, fontweight="bold")
-            ax3.set_xlabel("Częstotliwość [Hz]", fontsize=8)
-            ax3.set_ylabel("Magnituda", fontsize=8)
-            ax3.grid(True, linestyle="--", alpha=0.5)
-            ax3.set_xlim(left=0, right=orig_nyquist)
-            ax3.legend(loc="upper right", fontsize=7)
+            self.ax_orig_fft.clear()
+            self.ax_orig_fft.plot(f_orig_p, m_orig_p, color="#1f77b4", linewidth=0.8, label="Widmo sygnału")
+            self.ax_orig_fft.axvline(
+                orig_nyquist,
+                color="purple",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"Nyquist ({orig_nyquist:.0f} Hz)",
+            )
+            self.ax_orig_fft.set_title(
+                f"Przed próbkowaniem - Widmo FFT (Pasmo do {orig_nyquist:.0f} Hz)",
+                fontsize=9,
+                fontweight="bold",
+            )
+            self.ax_orig_fft.set_xlabel("Częstotliwość [Hz]", fontsize=8)
+            self.ax_orig_fft.set_ylabel("Magnituda", fontsize=8)
+            self.ax_orig_fft.grid(True, linestyle="--", alpha=0.5)
+            self.ax_orig_fft.set_xlim(left=0, right=orig_nyquist)
+            self.ax_orig_fft.legend(loc="upper right", fontsize=7)
 
-            # [1, 1] Resamplowane FFT z zaznaczoną nową granicą Nyquista
+            # Wykres 4: FFT po próbkowaniu
             target_nyquist = target_sr / 2
-            ax4 = self.axes[1, 1]
-            ax4.clear()
-            ax4.plot(f_res_p, m_res_p, color="#d62728", linewidth=0.8, label="Widmo sygnału")
-            ax4.axvline(target_nyquist, color="red", linestyle="--", linewidth=1.2, label=f"Nyquist Nowe ({target_nyquist:.0f} Hz)")
-            ax4.set_title(f"Po próbkowaniu - Widmo FFT (Granica Nyquista: {target_nyquist:.0f} Hz)", fontsize=9, fontweight="bold")
-            ax4.set_xlabel("Częstotliwość [Hz]", fontsize=8)
-            ax4.set_ylabel("Magnituda", fontsize=8)
-            ax4.grid(True, linestyle="--", alpha=0.5)
-            ax4.set_xlim(left=0, right=target_nyquist)
-            ax4.legend(loc="upper right", fontsize=7)
+            self.ax_res_fft.clear()
+            self.ax_res_fft.plot(f_res_p, m_res_p, color="#d62728", linewidth=0.8, label="Widmo sygnału")
+            self.ax_res_fft.axvline(
+                target_nyquist,
+                color="red",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"Nyquist Nowe ({target_nyquist:.0f} Hz)",
+            )
+            self.ax_res_fft.set_title(
+                f"Po próbkowaniu - Widmo FFT (Granica Nyquista: {target_nyquist:.0f} Hz)",
+                fontsize=9,
+                fontweight="bold",
+            )
+            self.ax_res_fft.set_xlabel("Częstotliwość [Hz]", fontsize=8)
+            self.ax_res_fft.set_ylabel("Magnituda", fontsize=8)
+            self.ax_res_fft.grid(True, linestyle="--", alpha=0.5)
+            self.ax_res_fft.set_xlim(left=0, right=target_nyquist)
+            self.ax_res_fft.legend(loc="upper right", fontsize=7)
 
             self.fig.subplots_adjust(hspace=0.45, wspace=0.25, left=0.07, right=0.98, top=0.93, bottom=0.1)
             self.canvas.draw()

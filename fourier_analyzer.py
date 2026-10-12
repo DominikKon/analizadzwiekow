@@ -1,11 +1,13 @@
-from typing import Tuple, Dict, Any
+from __future__ import annotations
+
+from typing import Tuple
 import numpy as np
 
 
 class FourierAnalyzer:
     """
     Klasa odpowiedzialna za analizę widmową (Transformata Fouriera / FFT)
-    oraz weryfikację kryterium Nyquista-Shannona.
+    oraz wymuszenie i walidację kryterium Nyquista-Shannona.
     """
 
     @staticmethod
@@ -15,7 +17,7 @@ class FourierAnalyzer:
         """
         Oblicza jednoronną transformatę Fouriera (rFFT) dla sygnału rzeczywistego.
         Wykorzystuje okno Hanna, aby zminimalizować efekt przecieku widma.
-        
+
         Zwraca:
             (częstotliwości [Hz], magnituda [amplituda])
         """
@@ -23,11 +25,9 @@ class FourierAnalyzer:
         if n_samples == 0:
             return np.array([]), np.array([])
 
-        # Aplikacja okna czasowego (Hanning)
         window = np.hanning(n_samples)
         windowed_signal = audio_signal * window
 
-        # Szybka transformata Fouriera
         fft_values = np.fft.rfft(windowed_signal)
         frequencies = np.fft.rfftfreq(n_samples, d=1.0 / sample_rate)
 
@@ -38,11 +38,11 @@ class FourierAnalyzer:
 
     @staticmethod
     def find_highest_significant_frequency(
-        frequencies: np.ndarray, magnitude: np.ndarray, threshold_ratio: float = 0.03
+        frequencies: np.ndarray, magnitude: np.ndarray, threshold_ratio: float = 0.02
     ) -> float:
         """
         Wyszukuje najwyższą istotną częstotliwość w widmie, której magnituda
-        przekracza zdefiniowany ułamek maksymalnej amplitudy (domyślnie 3%).
+        przekracza próg istotności (domyślnie 2% maksymalnej amplitudy).
         """
         if len(magnitude) == 0 or np.max(magnitude) == 0:
             return 0.0
@@ -58,43 +58,31 @@ class FourierAnalyzer:
         return float(frequencies[highest_idx])
 
     @staticmethod
-    def evaluate_nyquist_criterion(
+    def validate_nyquist_frequency(
         target_sr: int, max_present_frequency: float
-    ) -> Dict[str, Any]:
+    ) -> Tuple[bool, str, int]:
         """
-        Ocena spełnienia kryterium Nyquista-Shannona dla wybranej częstotliwości próbkowania:
-        Kryterium: f_s >= 2 * f_max (częstotliwość Nyquista f_N = f_s / 2 >= f_max).
+        Ścisła walidacja częstotliwości próbkowania:
+        Nie pozwala na wartość mniejszą niż dwukrotność najwyższej częstotliwości (f_s >= 2 * f_max).
+
+        Zwraca:
+            (czy_dozwolone: bool, komunikat: str, minimalne_wymagane_fs: int)
         """
-        nyquist_limit = target_sr / 2.0
-        required_sr = 2.0 * max_present_frequency
-        is_satisfied = nyquist_limit >= max_present_frequency
+        min_required_sr = int(np.ceil(2.0 * max_present_frequency))
+        if min_required_sr <= 0:
+            min_required_sr = 1
 
-        if is_satisfied:
-            clause = (
-                f"✅ KLAUZULA NYQUISTA SPEŁNIONA:\n"
-                f"Częstotliwość próbkowania Fs = {target_sr} Hz zapewnia granicę Nyquista f_N = {nyquist_limit:.1f} Hz. "
-                f"Jest ona większa niż maksymalna wykryta składowa sygnału ({max_present_frequency:.1f} Hz). "
-                f"Brak zjawiska aliasingu (próbkowanie bezstratne pasmowo)."
+        if target_sr < min_required_sr:
+            error_msg = (
+                f"Zablokowano: Częstotliwość próbkowania {target_sr} Hz łamie kryterium Nyquista!\n\n"
+                f"• Najwyższa wykryta składowa w sygnale: {max_present_frequency:.1f} Hz\n"
+                f"• Wymagana minimalna częstotliwość (2 × f_max): {min_required_sr} Hz\n\n"
+                f"Zwiększ wartość częstotliwości próbkowania do co najmniej {min_required_sr} Hz."
             )
-            status_level = "success"
-        else:
-            loss_hz = max_present_frequency - nyquist_limit
-            clause = (
-                f"⚠️ OSTRZEŻENIE - NARUSZENIE KRYTERIUM NYQUISTA:\n"
-                f"Wybrana częstotliwość Fs = {target_sr} Hz ustala granicę Nyquista na poziomie {nyquist_limit:.1f} Hz, "
-                f"podczas gdy w sygnale występują składowe do {max_present_frequency:.1f} Hz.\n"
-                f"Składowe w przedziale {nyquist_limit:.1f} - {max_present_frequency:.1f} Hz (~{loss_hz:.1f} Hz pasma) "
-                f"zostaną odcięte lub zniekształcone przez aliasing. "
-                f"Zalecane minimalne Fs: {int(np.ceil(required_sr))} Hz."
-            )
-            status_level = "warning"
+            return False, error_msg, min_required_sr
 
-        return {
-            "is_satisfied": is_satisfied,
-            "nyquist_limit": nyquist_limit,
-            "max_present_freq": max_present_frequency,
-            "required_sr": required_sr,
-            "clause": clause,
-            "status_level": status_level,
-        }
-
+        success_msg = (
+            f"Wartość {target_sr} Hz jest poprawna i spełnia kryterium Nyquista "
+            f"(wymagane min. {min_required_sr} Hz)."
+        )
+        return True, success_msg, min_required_sr
